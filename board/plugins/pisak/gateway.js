@@ -28,6 +28,7 @@ const TYPES = new Set(['request', 'response', 'oneway', 'broadcast']);
 const PROTOCOL_CODES = new Set(['UNKNOWN_NODE', 'UNKNOWN_APP', 'NO_LISTENER', 'TIMEOUT', 'NODE_UNAVAILABLE',
   'PEER_OVERLOADED', 'MESSAGE_TOO_LARGE', 'REJECTED', 'BAD_PROTOCOL']);
 const MAX_MESSAGE_BYTES = 65536;
+const MIN_TTL_MS = 50;
 const RESTART_GRACE_MS = 10000;
 
 const sleep = ms => new Promise(r => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
@@ -45,14 +46,16 @@ function safeEqual(a, b) {
 }
 
 class Gateway {
-  constructor(id = 'a') {
+  // `shared` lets an HA pair use one event stream and one metrics window, so cursors survive a failover.
+  constructor(id = 'a', shared = {}) {
     this.id = id;
     this.config = { ...DEFAULTS };
     this.nodes = new Map();
-    this.events = new Events();
-    this.metrics = new Metrics();
+    this.events = shared.events || new Events();
+    this.metrics = shared.metrics || new Metrics();
     this.status = 'up';
     this.startedAt = Date.now();
+    this.killedAt = 0;
     this.routes = 0; // authenticated route calls since the process started; admin reset does not clear it
     // Loopback to the board's own port (spore backend-4): never derived from the Host header. Without PORT, index.js
     // learns it from the first request's local port.
@@ -87,18 +90,42 @@ class Gateway {
     if (!this.nodes.has(nodeId) && this.nodes.size >= MAX_NODES) return badRequest(`registry full (${MAX_NODES} nodes)`);
 
     const now = Date.now();
-    const node = {
+    const node = this.makeNode({
       nodeId, apps: [...new Set(apps)], deliverUrl, heartbeatUrl, external: body.external === true,
-      token: 'gw-tok-' + crypto.randomBytes(16).toString('hex'),
-      status: 'up', slow: false, graceUntil: 0, leaving: false,
-      lastSeen: now, lastProbeAt: 0, probing: false, probeFailures: 0, probeSeq: 0,
-      breaker: { state: 'closed', failures: 0, openedAt: 0, trial: false },
-      bucket: { tokens: this.config.rateLimitBurst, last: now }, lastRateEvent: 0,
-      recent: [], inFlight: 0, registeredAt: now,
-    };
+      token: 'gw-tok-' + crypto.randomBytes(16).toString('hex'), registeredAt: now,
+    }, now);
     this.nodes.set(nodeId, node);
     this.events.emit('node-registered', { from: nodeId, to: 'gateway', ok: true, nodeId, apps: node.apps, external: node.external });
     return { status: 200, body: { token: node.token, probeIntervalMs: this.config.probeIntervalMs, probeTimeoutMs: this.config.probeTimeoutMs } };
+  }
+
+  makeNode(id, now) {
+    return {
+      ...id, status: 'up', slow: false, graceUntil: 0, leaving: false,
+      lastSeen: now, lastProbeAt: 0, probing: false, probeFailures: 0, probeSeq: 0,
+      breaker: { state: 'closed', failures: 0, openedAt: 0, trial: false },
+      bucket: { tokens: this.config.rateLimitBurst, last: now }, lastRateEvent: 0,
+      recent: [], inFlight: 0,
+    };
+  }
+
+  // ---------- HA replication (used by ha.js) ----------
+
+  // What a standby needs to take over without re-registration: identity, token and planned state.
+  snapshot() {
+    return [...this.nodes.values()].map(n => ({
+      nodeId: n.nodeId, apps: n.apps, deliverUrl: n.deliverUrl, heartbeatUrl: n.heartbeatUrl, external: n.external,
+      token: n.token, registeredAt: n.registeredAt, graceUntil: n.graceUntil, leaving: n.leaving, probeSeq: n.probeSeq,
+    }));
+  }
+
+  // Every restored node counts as just seen: the new active's own probes decide who is down.
+  restore(list) {
+    const now = Date.now();
+    this.nodes = new Map(list.map(s => {
+      const { graceUntil, leaving, probeSeq, ...id } = s;
+      return [s.nodeId, Object.assign(this.makeNode(id, now), { graceUntil, leaving, probeSeq })];
+    }));
   }
 
   // Returns the node when `req` carries the token of `nodeId`, otherwise a 401 result.
@@ -147,6 +174,13 @@ class Gateway {
     if (n.leaving) return 'leaving';
     if (n.graceUntil > Date.now()) return 'restarting';
     return n.slow ? 'slow' : 'up';
+  }
+
+  // Membership as the gateway sees it, sent with every probe so nodes keep per-peer state in gateway mode.
+  peersOf(node) {
+    const peers = {};
+    for (const n of this.nodes.values()) if (n !== node) peers[n.nodeId] = this.nodeStatus(n);
+    return peers;
   }
 
   // farzad's heartbeat state: a planned restart or leave is not a failure, so it must not raise node-down.
@@ -209,25 +243,27 @@ class Gateway {
         { 'retry-after': String(Math.max(1, Math.ceil(waitMs / 1000))) });
     }
 
-    const ttl = Number.isFinite(env.ttlMs) && env.ttlMs > 0 ? Math.min(env.ttlMs, 60000) : this.config.defaultTtlMs;
+    const ttl = Number.isFinite(env.ttlMs) && env.ttlMs > 0 ? Math.min(Math.max(env.ttlMs, MIN_TTL_MS), 60000) : this.config.defaultTtlMs;
     const deadline = t0 + ttl;
-    if (env.type === 'broadcast') return this.broadcast(env, src, deadline);
+    // A timeout only says something about the receiver if the sender gave it at least the gateway's own budget.
+    const fair = ttl >= this.config.defaultTtlMs;
+    if (env.type === 'broadcast') return this.broadcast(env, src, deadline, fair);
 
     const dest = this.nodes.get(env.destination.nodeId);
     if (!dest) return fail(404, 'UNKNOWN_NODE', `${env.destination.nodeId} is not registered`);
     if (env.destination.appId !== '*' && !dest.apps.includes(env.destination.appId)) return fail(404, 'UNKNOWN_APP', `${dest.nodeId} has no app ${env.destination.appId}`);
     if (dest.status === 'down') return fail(503, 'NODE_UNAVAILABLE', `${dest.nodeId} is down`, 'node_down');
-    return this.deliver(dest, env, deadline);
+    return this.deliver(dest, env, deadline, fair);
   }
 
-  async broadcast(env, src, deadline) {
+  async broadcast(env, src, deadline, fair) {
     const appId = env.destination.appId;
     const all = env.scope === 'all';
     const targets = [...this.nodes.values()].filter(n => n.nodeId !== src.nodeId
       && (appId === '*' || n.apps.includes(appId)) && (all || !n.external));
     const results = await Promise.all(targets.map(n => (n.status === 'down'
       ? Promise.resolve(fail(503, 'NODE_UNAVAILABLE', `${n.nodeId} is down`, 'node_down'))
-      : this.deliver(n, env, deadline).catch(err => fail(503, 'NODE_UNAVAILABLE', `delivery to ${n.nodeId} failed: ${err && err.message}`, 'internal')))));
+      : this.deliver(n, env, deadline, fair).catch(err => fail(503, 'NODE_UNAVAILABLE', `delivery to ${n.nodeId} failed: ${err && err.message}`, 'internal')))));
     const delivered = [], failed = [];
     results.forEach((r, i) => { if (r.ok) delivered.push(targets[i].nodeId); else failed.push({ nodeId: targets[i].nodeId, code: r.code }); });
     return { ok: true, status: 202, attempts: 1, failed, body: { accepted: true, messageId: env.messageId, delivered, failed } };
@@ -242,7 +278,7 @@ class Gateway {
   }
 
   // Breaker gate, then up to retries+1 attempts inside the deadline.
-  async deliver(node, env, deadline) {
+  async deliver(node, env, deadline, fair = true) {
     const b = node.breaker;
     if (b.state === 'open') {
       if (Date.now() - b.openedAt < this.config.breakerOpenMs) return fail(503, 'NODE_UNAVAILABLE', `circuit open for ${node.nodeId}`, 'circuit_open');
@@ -273,6 +309,7 @@ class Gateway {
       b.trial = false;
     }
     if (!result) result = { ...fail(504, 'TIMEOUT', `no answer from ${node.nodeId} within ttl`), failure: true };
+    if (result.code === 'TIMEOUT' && !fair) result.senderBudget = true;
     result.attempts = attempts;
     this.afterDelivery(node, result, Date.now() - t0);
     return result;
@@ -285,6 +322,7 @@ class Gateway {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-nodelink-gateway': 'pisak', 'x-nodelink-attempt': String(attempt) },
         body: JSON.stringify(env),
+        redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
       text = await res.text();
@@ -293,6 +331,11 @@ class Gateway {
         return { ...fail(504, 'TIMEOUT', `no answer from ${node.nodeId} within ${timeoutMs} ms`), failure: true, retryable: false };
       }
       return { ...fail(503, 'NODE_UNAVAILABLE', `cannot reach ${node.nodeId}: ${err && err.message}`, 'unreachable'), failure: true, retryable: true };
+    }
+    // Never follow a redirect: it could send the gateway to another host or to the board's own API.
+    if (res.status >= 300 && res.status < 400) {
+      return { ...fail(503, 'NODE_UNAVAILABLE', `${node.nodeId} answered with a redirect (HTTP ${res.status}), not followed`, 'bad_response'),
+        failure: true, retryable: false };
     }
     let body = null;
     if (text) { try { body = JSON.parse(text); } catch { body = null; } }
@@ -319,6 +362,7 @@ class Gateway {
 
   afterDelivery(node, r, ms) {
     if (this.nodes.get(node.nodeId) !== node) return; // deregistered or replaced meanwhile
+    if (r.senderBudget) return; // the sender's short ttl, not the node's fault: no breaker count, no latency sample
     if (r.failure) {
       const b = node.breaker;
       b.failures++;
@@ -384,7 +428,8 @@ class Gateway {
     fetch(this.url(node.heartbeatUrl), {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-nodelink-gateway': 'pisak' },
-      body: JSON.stringify({ from: 'gateway', seq: ++node.probeSeq, ts: Date.now(), state: 'up' }),
+      body: JSON.stringify({ from: 'gateway', seq: ++node.probeSeq, ts: Date.now(), state: 'up', peers: this.peersOf(node) }),
+      redirect: 'manual', // a 3xx is not res.ok, so it counts as a failed probe
       signal: AbortSignal.timeout(timeout),
     })
       .then(async res => {
@@ -407,6 +452,7 @@ class Gateway {
     const action = body && body.action;
     if (action === 'kill') {
       this.status = 'down';
+      this.killedAt = Date.now();
       this.nodes.clear();
       this.events.emit('gateway-killed', { from: 'control', to: 'gateway', ok: false, gatewayId: this.id });
     } else if (action === 'revive') {

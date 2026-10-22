@@ -1,6 +1,6 @@
 # Gateway contract (module B, team pisak)
 
-Status: **v0.3, implemented** in `board/plugins/pisak/` (tests: `projects/pisak/test/gateway.test.mjs`). Comments and
+Status: **v0.6, implemented** in `board/plugins/pisak/` (tests: `projects/pisak/test/gateway.test.mjs`). Comments and
 change requests go to `@pisak` in `#build`. Only pisak changes this file, and every change is announced in `#build`
 before it ships.
 
@@ -35,7 +35,7 @@ These align the gateway with farzad's Node contract v0.2. They were announced in
 - **Heartbeat and probes:**
   - The heartbeat body may name the node with `nodeId` or `from`.
   - `state: "restarting"` gives 10 s of grace. `"leaving"` is not a failure.
-  - Probes send `{from, seq, ts, state}` and read `state` from the answer.
+  - Probes send `{from, seq, ts, state, peers}` and read `state` from the answer.
 - **State:** adds `routes`, `possibleLinks`, `openConnections`, `maxMessageBytes`, `nodes[].external` and `links[].state`
   (`reachable` | `unreachable` | `restarting` | `disabled`). Node `status` adds `restarting` and `leaving`.
 - **Metrics:** the window is 10 s, the same as farzad's (was 60 s). `errors` has a key for every protocol code.
@@ -57,6 +57,28 @@ requests in `#build`.
   `ok`, `latencyMs`, `errorCode`. The polling answer is `{seq, events}`, the same as farzad's.
 - `/state` has per-node `status` (`up` | `slow` | `down`), `circuit` and `links`. Metric names are `p50Ms`, `p95Ms`,
   `throughputPerSec`, `errorRate` and `detectMs`, the same as farzad's.
+
+## Changes in v0.6 (HA pair, demo step 6)
+
+- Additive, off by default: an HA pair of gateway instances behind the same base URL (section 9). With HA off,
+  nothing changes: `kill` takes the gateway down and nodes register again after `revive`.
+- New admin action `ha` (`{ "enabled": true, "detectMs": 1000 }`). `kill` and `revive` take an optional `instance`.
+- `/state` gains an `ha` block. New events: `gateway-failover`, `ha-enabled`, `ha-disabled`.
+- `gateway.id` in `/state` is the active instance (`a` or `b`) and may change on a failover.
+
+## Changes in v0.5 (requested by farzad)
+
+- Additive: every probe body carries `peers`, the gateway's view of every **other** registered node and its status
+  (`up` | `slow` | `down` | `restarting` | `leaving`), for example `{"n2":"up","n3":"down"}`. Nodes use it to keep
+  per-peer state in gateway mode. A node that does not know the field can ignore it.
+
+## Changes in v0.4 (review by farzad)
+
+- The gateway never follows redirects, for deliveries or for probes. A node that answers 3xx gets `503
+  NODE_UNAVAILABLE` with `reason: "bad_response"` (not retried), and a 3xx heartbeat answer is a failed probe.
+- `ttlMs` has a floor of 50 ms.
+- A `TIMEOUT` caused by a sender's short `ttlMs` (below `defaultTtlMs`) does not count toward the receiver's circuit
+  breaker and is not used for its `slow` status.
 
 ## 1. Message envelope
 
@@ -84,7 +106,8 @@ differ.
   that has `destination.appId` (or to every node, for `"*"`), except the sender. Nodes registered as `external` are
   only included with `scope: "all"`.
 - `correlationId`: a response carries the request's `messageId`.
-- `ttlMs`: the total time the gateway may spend on the message, retries included.
+- `ttlMs`: the total time the gateway may spend on the message, retries included. Values below 50 are raised to 50,
+  values above 60000 are lowered to 60000.
 - Size: at most 65536 bytes of JSON, otherwise `413 MESSAGE_TOO_LARGE`.
 
 ## 2. Error format and codes
@@ -101,7 +124,7 @@ for every error the gateway makes itself.
 | `UNKNOWN_NODE`      | 404       | the destination nodeId is not registered                                               |
 | `UNKNOWN_APP`       | 404       | the node is registered but does not have that appId                                    |
 | `TIMEOUT`           | 504       | no answer within `ttlMs`, retries included                                             |
-| `NODE_UNAVAILABLE`  | 503       | `reason` is `"node_down"` (failed probes), `"circuit_open"`, `"unreachable"`, `"bad_response"` (the node answered without a NodeLink error), or `"gateway_down"` (the gateway is killed) |
+| `NODE_UNAVAILABLE`  | 503       | `reason` is `"node_down"` (failed probes), `"circuit_open"`, `"unreachable"`, `"bad_response"` (the node answered without a NodeLink error, or with a redirect: the gateway never follows a 3xx), or `"gateway_down"` (the gateway is killed) |
 | `REJECTED`          | 401 / 429 | `reason` is `"auth"` (401: missing token, bad token, or a token that is not the sender's) or `"rate_limit"` (429, with a `Retry-After` header) |
 | `MESSAGE_TOO_LARGE` | 413       | the envelope is larger than 65536 bytes                                                |
 | `BAD_PROTOCOL`      | 400       | invalid envelope or body, wrong `proto`, or unsupported `version`                       |
@@ -182,7 +205,8 @@ The node answers as in farzad section 3: `200` with the response envelope for a 
 ## 5. Failure detection: the gateway probes the nodes
 
 Every `probeIntervalMs` (default 1000) the gateway sends `POST <heartbeatUrl>` with the body
-`{ "from": "gateway", "seq": <n>, "ts": <now>, "state": "up" }`, using farzad's heartbeat format. farzad agreed in
+`{ "from": "gateway", "seq": <n>, "ts": <now>, "state": "up", "peers": { "n2": "up", "n3": "down" } }`, using farzad's
+heartbeat format plus `peers` (v0.5: every other registered node with its `/state` status, never the node itself). farzad agreed in
 `#build` that nodes answer these probes in every mode, and that a killed node stays silent.
 
 - A node that answers no probe and sends no `/heartbeat` for `probeTimeoutMs` (default 3000) is marked `down`, unless
@@ -199,7 +223,7 @@ All of these can be changed at runtime with `config` (section 7).
 |-------------------|---------|---------------------------------------------------------------------------------|
 | `defaultTtlMs`    | 2000    | used when the envelope has no `ttlMs`                                           |
 | `retries`         | 2       | extra attempts after a network error or a 503, with backoff (100 ms, then 200 ms), all inside `ttlMs` |
-| `breakerFailures` | 5       | consecutive failures to a node before its circuit **opens**                     |
+| `breakerFailures` | 5       | consecutive failures to a node before its circuit **opens**. A `TIMEOUT` only counts when the sender's `ttlMs` was at least `defaultTtlMs`: a short sender budget is not the node's fault |
 | `breakerOpenMs`   | 5000    | time in open state before one **half-open** trial message                       |
 | `rateLimitPerSec` | 50      | token bucket per source node                                                    |
 | `rateLimitBurst`  | 100     | bucket size                                                                     |
@@ -295,6 +319,8 @@ don't apply. In a `message` event, `type` is the message type (`request`, `onewa
 - `circuit-open`, `circuit-half-open`, `circuit-closed` (`to` is the node)
 - `rate-limited` (`from` is the node)
 - `gateway-killed`, `gateway-revived`, `config-changed`
+- `gateway-failover` (`from` / `to` are instance ids, plus `failoverMs` and `nodes`), `ha-enabled` (with
+  `detectMs`), `ha-disabled` (section 9)
 
 ### POST `/admin`
 
@@ -302,10 +328,11 @@ Chaos and configuration, for Control. The body is `{ "action": "<action>", ... }
 
 | action   | body                           | effect                                                                    |
 |----------|--------------------------------|---------------------------------------------------------------------------|
-| `kill`   | –                              | the gateway goes `down`: every node-facing call answers `503 NODE_UNAVAILABLE` with `reason: "gateway_down"` |
-| `revive` | –                              | the gateway is `up` again. Registrations are lost, so nodes must register again |
+| `kill`   | `{ "instance"?: "a" \| "b" }`   | the gateway (default: the active instance) goes `down`: every node-facing call answers `503 NODE_UNAVAILABLE` with `reason: "gateway_down"` |
+| `revive` | `{ "instance"?: "a" \| "b" }`   | the gateway (default: the active instance, and the standby too when HA is on) is `up` again. Without HA, registrations are lost, so nodes must register again |
 | `config` | `{ "config": { ...partial } }` | changes the settings in section 6                                         |
-| `reset`  | –                              | clears nodes, metrics and events (between demo runs). It does **not** revive a killed gateway |
+| `reset`  | –                              | clears nodes, metrics and events (between demo runs). It does **not** revive a killed gateway, and it keeps the HA setting |
+| `ha`     | `{ "enabled": bool, "detectMs"?: 100..10000 }` | turns the HA pair on or off (section 9)                    |
 
 Answer: `200 { "ok": true, "state": <same as GET /state> }`. `GET /state`, `/metrics` and `/events` keep answering
 while the gateway is killed, so the dashboard can show it.
@@ -318,16 +345,38 @@ farzad owns the mode (`POST /t/farzad/api/mode`).
 - On leaving gateway mode, they `deregister`.
 - Control may call our `reset` before a gateway run, so it starts from zero metrics.
 
-## 9. Stretch: HA pair
+## 9. Stretch: HA pair (v0.6)
 
-There are two instances, `a` and `b`, at `/t/pisak/gw/a/api` and `/t/pisak/gw/b/api`. Each has the API above.
-`/t/pisak/api` is an alias for the currently active instance.
+There are two gateway instances, `a` and `b`, in an active/standby pair behind the **same** base URL
+`/t/pisak/api`. Nodes need no change: they keep one URL and one token.
 
-- The two instances share their registry, so a failover keeps registrations and tokens.
-- Nodes that get `503` with `reason: "gateway_down"` retry against the other instance.
-- `kill` and `revive` take `{ "instance": "a" | "b" }`.
+- **Off by default.** Only `a` runs, and `b` is `off`. A `kill` takes the gateway down until `revive`.
+- **Turn it on:** `POST /admin {"action":"ha","enabled":true,"detectMs":1000}`. The standby starts and receives a
+  copy of the active registry (nodes, apps, delivery URLs and tokens) every 250 ms. If the active is already dead,
+  the standby takes over at once with an empty registry (this is not counted as a failover).
+- **Failover:** when the active is killed, node-facing calls answer `503 gateway_down` until `detectMs` has passed.
+  Then the standby becomes active with the replicated registry: the same tokens work, and nobody registers again.
+  Every `register` and `deregister` is also written through to the standby at once, so a token handed out just
+  before the kill still works after the failover.
+- **Not replicated:** circuit breakers, rate-limit buckets, in-flight requests and latency samples. The new active
+  starts them fresh and probes every node itself. Events and metrics are shared, so the dashboard sees one stream.
+- **Fail back:** `revive` brings the dead instance back as the standby, resynced from the active.
+  `kill {"instance":"b"}` then fails over again. Killing the standby only removes the protection.
+- **Turn it off:** `{"action":"ha","enabled":false}` stops the standby. If the active was dead, the running standby
+  stays on as the only instance.
 
-This is to be confirmed with farzad before we build it.
+`/state` (and every admin answer) carries:
+
+```json
+"ha": { "enabled": true, "active": "b", "detectMs": 1000, "failovers": 1, "lastFailoverMs": 1012,
+        "lastFailoverAt": 1792915260000,
+        "instances": [ { "id": "a", "status": "down", "role": "standby", "nodes": 0 },
+                       { "id": "b", "status": "up", "role": "active", "nodes": 4 } ] }
+```
+
+`role` is `active` | `standby` | `off`. For the demo (step 6): run gateway mode, `kill`, and the dashboard shows
+every node unreachable. Then `revive`, `ha` on, and `kill` again: after about `detectMs` traffic flows again, and
+`lastFailoverMs` is the number to compare with the time a mesh needs to detect the same failure.
 
 ## 10. Example: one request in gateway mode
 

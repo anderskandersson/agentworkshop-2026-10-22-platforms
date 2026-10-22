@@ -7,6 +7,15 @@ const DEDUP_MAX = 256;
 const DEDUP_MS = 60000;
 const INFLIGHT_LIMIT = 50;
 const QUEUE_MAX = 1000;
+const MAX_PEERS = 64;
+const MAX_CODES = 32;
+// Error codes can come from remote answers: past MAX_CODES distinct keys they are counted as OTHER.
+const bump = (m, code) => { const k = (code in m || Object.keys(m).length < MAX_CODES) ? code : 'OTHER'; m[k] = (m[k] || 0) + 1; };
+// Gateway probe peer states mapped to the link-state vocabulary (CONTRACT.md section 3).
+// Gateway peer status -> link state. slow: the gateway still hears the node, just late.
+const PEER_STATE = { up: 'reachable', slow: 'reachable', restarting: 'restarting', down: 'unreachable', leaving: 'disabled' };
+const TYPES = ['request', 'response', 'oneway', 'broadcast'];
+const zero = () => Object.fromEntries(TYPES.map((t) => [t, 0]));
 const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
 
 class VirtualNode {
@@ -21,6 +30,12 @@ class VirtualNode {
     this.apps = new Map();
     this.chaos = { delayMs: 0, dropPercent: 0, skewMs: 0 };
     this.dedup = new Map();
+    this.dedupHits = 0;
+    this.pending = 0;
+    this.counters = { sent: zero(), received: zero(), failures: {} };
+    this.byPeer = new Map();
+    this.gwPeers = new Map();
+    this.gwPeersTs = null;
     this.waiters = [];
     this.route = 'mesh';
     this.forceDisabled = false;
@@ -69,8 +84,72 @@ class VirtualNode {
     return (app && app.msgTypes[String(msgTypeId)]) || null;
   }
 
-  view() {
-    return { nodeId: this.id, external: this.external, status: this.status, messaging: this.messaging, inflight: this.inflight, apps: this.appList(), chaos: { ...this.chaos } };
+  // Per-peer counters, created on first traffic. Capped so made-up source ids cannot grow /state without bound.
+  peer(id) {
+    if (typeof id !== 'string' || !id || id === '*') return null;
+    let p = this.byPeer.get(id);
+    if (!p && this.byPeer.size < MAX_PEERS) { p = { sent: zero(), received: zero(), failures: {} }; this.byPeer.set(id, p); }
+    return p || null;
+  }
+
+  countSent(type, peerId) {
+    if (!(type in this.counters.sent)) return;
+    this.counters.sent[type] += 1;
+    if (peerId !== undefined) this.countPeerSent(type, peerId);
+  }
+
+  countPeerSent(type, peerId) { const p = this.peer(peerId); if (p && type in p.sent) p.sent[type] += 1; }
+
+  countReceived(type, peerId) {
+    if (!(type in this.counters.received)) return;
+    this.counters.received[type] += 1;
+    const p = this.peer(peerId);
+    if (p) p.received[type] += 1;
+  }
+
+  countFailure(code, peerId) {
+    const k = code || 'UNKNOWN';
+    bump(this.counters.failures, k);
+    const p = this.peer(peerId);
+    if (p) bump(p.failures, k);
+  }
+
+  // A gateway probe carried {peers: {nodeId: state}}: remember each peer's state and when we heard it.
+  onGatewayPeers(peers, now) {
+    if (!peers || typeof peers !== 'object' || Array.isArray(peers)) return;
+    this.gwPeersTs = now;
+    for (const [id, st] of Object.entries(peers)) {
+      if (id === this.id || typeof st !== 'string') continue;
+      if (!this.gwPeers.has(id) && this.gwPeers.size >= MAX_PEERS) continue;
+      this.gwPeers.set(id, { state: st.slice(0, 16), ts: now });
+    }
+  }
+
+  // The gateway's view of one peer as a link state; unknown when it never told us, left it out of the latest probe,
+  // or its probes stopped (3 probe intervals).
+  peerView(id, now) {
+    const v = this.gwPeers.get(id);
+    const ts = v ? v.ts : null;
+    const fresh = v && v.ts === this.gwPeersTs && now - v.ts <= 3 * this.probeIntervalMs;
+    const state = fresh ? PEER_STATE[v.state] || 'unknown' : 'unknown';
+    return { from: this.id, to: id, via: 'gateway', state, peerStatus: fresh ? v.state : null, clockSync: null, offsetMs: null, lastHeartbeatTs: ts, misses: null, heartbeatAgeMs: ts === null ? null : now - ts };
+  }
+
+  view(now) {
+    const c = this.counters;
+    const gwRoute = this.external || this.route === 'gateway';
+    return {
+      nodeId: this.id, external: this.external, status: this.status, messaging: this.messaging, inflight: this.inflight, apps: this.appList(), chaos: { ...this.chaos },
+      limits: { inflight: INFLIGHT_LIMIT },
+      queued: this.waiters.length,
+      pending: this.pending,
+      dedup: { size: this.dedup.size, hits: this.dedupHits },
+      gateway: { registered: !!this.token, lastProbeAgeMs: gwRoute && this.token && this.lastProbeTs ? now - this.lastProbeTs : null },
+      counters: {
+        sent: { ...c.sent }, received: { ...c.received }, failures: { ...c.failures },
+        byPeer: Object.fromEntries([...this.byPeer].map(([id, p]) => [id, { sent: { ...p.sent }, received: { ...p.received }, failures: { ...p.failures } }])),
+      },
+    };
   }
 
   // ----- messaging enabled / queued sends -----
@@ -132,10 +211,11 @@ class VirtualNode {
     this.pruneDedup(now);
     const seen = this.dedup.get(env.messageId);
     if (seen) {
+      this.dedupHits += 1;
       if (env.type === 'request') return seen.promise;
       return { status: 202, body: { accepted: true, duplicate: true } };
     }
-    if (this.inflight >= INFLIGHT_LIMIT) return this.fail(E.error('PEER_OVERLOADED', this.id, `${this.inflight} messages in flight`), env);
+    this.countReceived(env.type, env.source.nodeId);
     const promise = this.process(env);
     this.dedup.set(env.messageId, { ts: now, promise });
     this.pruneDedup(now);
@@ -146,28 +226,24 @@ class VirtualNode {
     return { status: E.statusOf(err), body: { error: err, correlationId: (env && typeof env.messageId === 'string') ? env.messageId : null } };
   }
 
+    // In-flight accounting (PEER_OVERLOADED) is done by the deliver endpoint, so that messages held by slow chaos count.
   async process(env) {
-    this.inflight += 1;
-    try {
-      const d = env.destination;
-      let targets;
-      if (d.appId === '*') targets = [...this.apps.values()];
-      else {
-        const app = this.apps.get(d.appId);
-        if (!app) return this.fail(E.error('UNKNOWN_APP', this.id, `no application ${d.appId} on ${this.id}`), env);
-        if (d.listenerId != null && !app.listenerIds.has(d.listenerId)) return this.fail(E.error('NO_LISTENER', this.id, `no listener ${d.listenerId}`), env);
-        targets = [app];
-      }
-      if (env.type !== 'request') return { status: 202, body: { accepted: true } };
-      // A request is answered by the first application that answers; sink never answers.
-      if (!targets.some((a) => a.kind !== 'sink')) {
-        await sleep(Math.min(env.ttlMs || E.DEFAULT_TTL, 30000));
-        return this.fail(E.error('TIMEOUT', this.id, `${d.appId} does not answer requests`), env);
-      }
-      return { status: 200, body: this.response(env) };
-    } finally {
-      this.inflight -= 1;
+    const d = env.destination;
+    let targets;
+    if (d.appId === '*') targets = [...this.apps.values()];
+    else {
+      const app = this.apps.get(d.appId);
+      if (!app) return this.fail(E.error('UNKNOWN_APP', this.id, `no application ${d.appId} on ${this.id}`), env);
+      if (d.listenerId != null && !app.listenerIds.has(d.listenerId)) return this.fail(E.error('NO_LISTENER', this.id, `no listener ${d.listenerId}`), env);
+      targets = [app];
     }
+    if (env.type !== 'request') return { status: 202, body: { accepted: true } };
+    // A request is answered by the first application that answers; sink never answers.
+    if (!targets.some((a) => a.kind !== 'sink')) {
+      await sleep(Math.min(env.ttlMs || E.DEFAULT_TTL, 30000));
+      return this.fail(E.error('TIMEOUT', this.id, `${d.appId} does not answer requests`), env);
+    }
+    return { status: 200, body: this.response(env) };
   }
 
   response(req) {
@@ -178,8 +254,9 @@ class VirtualNode {
       timestamp: this.now(), correlationId: req.messageId, ttlMs: req.ttlMs ?? E.DEFAULT_TTL, payload: req.payload ?? null,
     };
     if (req.msgTypeId !== undefined && req.msgTypeId !== null) r.msgTypeId = req.msgTypeId;
+    this.countSent('response', req.source.nodeId);
     return r;
   }
 }
 
-module.exports = { VirtualNode };
+module.exports = { VirtualNode, INFLIGHT_LIMIT, bump };

@@ -65,7 +65,8 @@ class Sender {
       state: 'pending', result: null, userData: body.userData === undefined ? null : body.userData, epoch: this.c.epoch,
     };
     if (!internal) this.store(rec);
-    const p = this.run(rec);
+    if (type === 'request') node.pending += 1;
+    const p = this.run(rec).finally(() => { if (type === 'request') node.pending -= 1; });
     if (body.async === true) {
       p.catch((e) => log(e && e.message));
       return { status: 202, body: { requestId: rec.requestId } };
@@ -89,6 +90,7 @@ class Sender {
       else {
         env.timestamp = node.now();
         rec.route = node.route;
+        node.countSent(env.type, env.type === 'broadcast' ? undefined : env.destination.nodeId);
         core = await this.dispatch(node, env, deadline, signal);
       }
     }
@@ -106,12 +108,18 @@ class Sender {
     if (outcome === 'response') result.response = core.response;
     if (outcome === 'broadcast') { result.delivered = core.delivered; result.failed = core.failed; }
     result.error = core.error || null;
+    const peerId = env.destination.nodeId;
+    if (core.error) node.countFailure(core.error.code, peerId);
+    else if (core.failed) for (const f of core.failed) node.countFailure(f.code, f.nodeId);
+    // A broadcast counts per destination once we know which ones were tried.
+    if (rec.type === 'broadcast' && !core.error) for (const id of [...(core.delivered || []), ...(core.failed || []).map((f) => f.nodeId)]) node.countPeerSent('broadcast', id);
+    if (outcome === 'response') node.countReceived('response', peerId);
     result.userData = rec.userData;
     const ok = !core.error && !(core.failed && core.failed.length);
     const mode = rec.route || node.route;
-    this.c.metrics.record(mode, latencyMs, ok);
-    const dest = this.c.nodes.get(env.destination.nodeId);
     const errorCode = core.error ? core.error.code : (core.failed && core.failed.length ? core.failed[0].code : null);
+    this.c.metrics.record(mode, latencyMs, ok, errorCode);
+    const dest = this.c.nodes.get(env.destination.nodeId);
     this.c.emit({
       type: `message.${rec.type}`, from: node.id, to: env.destination.nodeId, ok, latencyMs, errorCode, mode,
       messageId: rec.messageId, requestId: rec.requestId, appId: env.destination.appId, msgTypeId: env.msgTypeId ?? null,
