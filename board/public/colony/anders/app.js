@@ -238,6 +238,11 @@ function renderBadges() {
     return `<span class="badge ${st === 'demo' ? '' : st}">${s.label}: ${st}</span>`;
   });
   if (demo) b.unshift('<span class="badge demo">DEMO DATA</span>');
+  const ha = model.gw && model.gw.ha;
+  if (ha && ha.enabled) {
+    b.push(`<span class="badge live">Gateway HA: active ${ha.active}, failovers ${ha.failovers ?? 0}` +
+      `${ha.lastFailoverMs != null ? ', last ' + ha.lastFailoverMs + ' ms' : ''}</span>`);
+  }
   $('#badges').innerHTML = b.join('');
   $('#mode').textContent = model.mode + (model.switching ? ' (switching)' : '');
   document.querySelectorAll('[data-mode]').forEach(x => x.classList.toggle('on', x.dataset.mode === model.mode));
