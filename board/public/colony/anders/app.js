@@ -73,7 +73,7 @@ async function pollState() {
 function apply(s) {
   Object.assign(model, { mode: s.mode || '-', switching: !!s.switching, nodes: s.nodes || [], links: s.links || [],
     possibleLinks: s.possibleLinks ?? 0, openConnections: s.openConnections ?? s.connections ?? 0,
-    metrics: s.metrics || { mesh: {}, gateway: {} } });
+    metrics: s.metrics || { mesh: {}, gateway: {} }, lastRun: s.metrics?.lastRun || null });
   if (model.mode === 'mesh' || model.mode === 'gateway')
     conns[model.mode] = { open: model.openConnections, possible: model.possibleLinks };
 }
@@ -232,6 +232,16 @@ function renderMetrics() {
   }).join('');
 }
 
+function renderLastRun() {
+  const el = $('#lastrun'); if (!el) return;
+  const lr = model.lastRun, m = lr?.mesh, g = lr?.gateway;
+  if (!m && !g) { el.innerHTML = ''; return; }
+  const rows = [['Messages', 'messages', v => v ?? 'n/a'], ['Latency p50', 'p50Ms', fmt.ms], ['Latency p95', 'p95Ms', fmt.ms],
+    ['Throughput', 'throughputPerSec', fmt.rate], ['Error rate', 'errorRate', fmt.pct], ['Detection (avg)', 'detectMsAvg', fmt.ms]];
+  el.innerHTML = '<caption>Last run per mode (farzad)</caption><tr><th></th><th>Mesh</th><th>Gateway</th></tr>' +
+    rows.map(([n, k, f]) => `<tr><td>${n}</td><td>${m ? f(m[k]) : 'no run'}</td><td>${g ? f(g[k]) : 'no run'}</td></tr>`).join('');
+}
+
 function renderBadges() {
   const b = Object.entries(SRC).map(([k, s]) => {
     const st = demo && k !== 'control' ? 'demo' : s.live ? 'live' : 'down';
@@ -250,7 +260,7 @@ function renderBadges() {
   $('#sel').textContent = selected ? 'target: ' + selected : 'no node selected';
 }
 
-function render() { renderBadges(); renderTopology(); renderMetrics(); }
+function render() { renderBadges(); renderTopology(); renderMetrics(); renderLastRun(); }
 
 // ---------- event log ----------
 function log(e) {
